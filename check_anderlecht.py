@@ -3,10 +3,10 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 
 import requests
-from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
 START = "https://www.securiteautomobile.be/Rdv_pc"
@@ -145,6 +145,31 @@ def type_into(locator, value):
     locator.press_sequentially(value, delay=70)
 
 
+def first_visible(page, pattern, timeout=15):
+    """Premier élément visible dont le texte correspond (ignore les doublons cachés)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        loc = page.get_by_text(pattern)
+        for i in range(loc.count()):
+            if loc.nth(i).is_visible():
+                return loc.nth(i)
+        time.sleep(0.5)
+    raise RuntimeError(f"élément introuvable ou caché : {pattern.pattern}")
+
+
+def wait_for_booking_page(ctx, timeout=30):
+    """Attend que la page de réservation (booking.exam.s-a.be) soit ouverte, même dans un nouvel onglet."""
+    end = time.time() + timeout
+    while time.time() < end:
+        for pg in ctx.pages:
+            if "exam.s-a.be" in pg.url:
+                pg.wait_for_load_state("networkidle", timeout=60000)
+                return pg
+        time.sleep(0.5)
+    urls = " | ".join(pg.url[:80] for pg in ctx.pages)
+    raise RuntimeError(f"la page de réservation ne s'est pas ouverte (onglets : {urls})")
+
+
 def run():
     status, slots, err, excerpt = "unknown", {}, "", ""
     step = "démarrage"
@@ -157,17 +182,20 @@ def run():
             page.goto(START, wait_until="networkidle", timeout=60000)
 
             step = "popup « J'ai compris »"
-            try_click(page, re.compile(r"J.ai compris", re.I), timeout=5000)
+            try:
+                page.get_by_text(re.compile(r"J.ai compris", re.I)).first.click(timeout=8000)
+                page.wait_for_timeout(1200)  # fin de l'animation de fermeture
+            except Exception:
+                pass
 
             step = "bouton « Prendre un RDV »"
-            btn = page.get_by_text(re.compile(r"Prendre un RDV", re.I)).first
-            try:
-                with ctx.expect_page(timeout=8000) as info:
-                    btn.click(timeout=10000)
-                page = info.value
-            except PWTimeout:
-                pass  # même onglet
-            page.wait_for_load_state("networkidle", timeout=60000)
+            target = first_visible(page, re.compile(r"Prendre un RDV", re.I))
+            href = target.evaluate("el => { const a = el.closest('a'); return a ? a.href : ''; }")
+            if href.startswith("http") and not href.rstrip("/").endswith("#"):
+                page.goto(href, wait_until="networkidle", timeout=60000)
+            else:
+                target.click(timeout=10000)
+            page = wait_for_booking_page(ctx, 30)
 
             step = "cookies"
             try_click(page, re.compile(r"Accepter et fermer", re.I), timeout=5000)
@@ -271,7 +299,8 @@ def main():
     elif key == "unknown" and last.get("status") != "unknown":
         send(f"⚠️ <b>{CENTER}</b> : le script est bloqué.\n{htmllib.escape(err)}")
 
-    json.dump({"status": key, "slots": slots}, open(STATE_FILE, "w"))
+    if not TEST:  # un test ne doit pas marquer des créneaux comme « déjà vus »
+        json.dump({"status": key, "slots": slots}, open(STATE_FILE, "w"))
     print("state:", key, "nouveaux:", len(new))
     return 0
 
