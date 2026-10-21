@@ -223,7 +223,8 @@ def main():
     elif key == "unknown" and last.get("status") != "unknown":
         send(f"⚠️ <b>Schaerbeek</b> : le script ne trouve plus la carte Cat. B. {htmllib.escape(err)}")
 
-    json.dump({"status": key, "slots": slots}, open(STATE_FILE, "w"))
+    if not TEST:  # un test ne doit pas marquer des créneaux comme « déjà vus »
+        json.dump({"status": key, "slots": slots}, open(STATE_FILE, "w"))
     print("state:", key, "nouveaux:", len(new))
 
 
