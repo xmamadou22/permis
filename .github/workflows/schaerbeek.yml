@@ -2,11 +2,11 @@ name: Alerte permis B (Schaerbeek + Anderlecht)
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/30 * * * *"   # relance de la surveillance (une seule tourne à la fois)
   workflow_dispatch:
     inputs:
       test:
-        description: "Envoyer un message de test (1 = oui)"
+        description: "Envoyer un message de test (1 = oui, 0 = lancer la surveillance)"
         default: "0"
       card:
         description: "B = surveillance normale, first = test sur la 1re carte"
@@ -15,9 +15,17 @@ on:
 permissions:
   contents: write
 
+# Une seule surveillance à la fois ; les tests ont leur propre file.
+concurrency:
+  group: ${{ github.event.inputs.test == '1' && format('permis-test-{0}', github.run_id) || 'permis-surveillance' }}
+  cancel-in-progress: false
+
 jobs:
   check:
+    # Sécurité : ne tourne que si le dépôt est public (minutes gratuites illimitées).
+    if: github.event.repository.private == false
     runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -25,28 +33,40 @@ jobs:
           python-version: "3.12"
       - run: pip install requests playwright
       - run: playwright install --with-deps chromium
-      - run: python check_schaerbeek.py
+
+      - name: Surveillance
+        timeout-minutes: 350
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TEST: ${{ github.event.inputs.test }}
-          ID_DATE: ${{ secrets.ID_DATE }}
           CARD: ${{ github.event.inputs.card }}
-      - name: Anderlecht
-        if: always()
-        run: python check_anderlecht.py
-        env:
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          TEST: ${{ github.event.inputs.test }}
+          ID_DATE: ${{ secrets.ID_DATE }}
           AND_PRENOM: ${{ secrets.AND_PRENOM }}
           AND_NOM: ${{ secrets.AND_NOM }}
           AND_NAISSANCE: ${{ secrets.AND_NAISSANCE }}
           AND_RRN: ${{ secrets.AND_RRN }}
+        run: |
+          if [ "$TEST" = "1" ]; then
+            python check_schaerbeek.py || true
+            python check_anderlecht.py || true
+            exit 0
+          fi
+          end=$((SECONDS + 20700))   # ~5 h 45 min puis le job suivant prend le relais
+          i=0
+          while [ $SECONDS -lt $end ]; do
+            python check_schaerbeek.py || true &
+            # Anderlecht demande l'identité à chaque passage : on le vérifie 1 tour sur 3
+            if [ $((i % 3)) -eq 0 ]; then python check_anderlecht.py || true & fi
+            wait
+            i=$((i + 1))
+            sleep 5
+          done
+
       - name: Sauver l'état
         if: always()
         run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
           git add state_*.txt
-          git diff --staged --quiet || (git commit -m "state" && git push)
+          git diff --staged --quiet || (git commit -m "state" && git pull --rebase -q && git push)
