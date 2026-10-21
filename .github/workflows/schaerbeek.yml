@@ -20,7 +20,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install requests
+      - run: pip install requests playwright
+      - run: playwright install --with-deps chromium
       - run: python check_schaerbeek.py
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
