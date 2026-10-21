@@ -17,21 +17,39 @@ ID_DATE = os.environ["ID_DATE"]  # date de validité de la carte, ex. JJ/MM/AAAA
 TEST = os.environ.get("TEST") == "1"
 CARD = (os.environ.get("CARD") or "B").strip()  # "B" = vraie surveillance, "first" = test sur la 1re carte
 
-# Lit le calendrier : pour chaque date, les heures cliquables (boutons) et toutes les heures vues.
-JS_CALENDAR = """
+# Calendrier : pour chaque date, heures cliquables (boutons) et toutes les heures vues.
+# On lit le texte propre de chaque élément (robuste si le bouton contient une icône).
+JS_CALENDAR = r"""
 () => {
+  const own = (el) => el.tagName === "INPUT"
+    ? (el.value || "").trim()
+    : Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join("").trim();
   const out = {};
   let cur = null;
   for (const el of document.querySelectorAll("body *")) {
-    if (el.children.length) continue;
-    const t = (el.textContent || "").trim();
-    if (/^\\d{2}-\\d{2}-\\d{2}$/.test(t)) { cur = t; out[cur] = out[cur] || {btn: [], all: []}; continue; }
-    if (cur && /^\\d{2}:\\d{2}$/.test(t)) {
+    const t = own(el);
+    if (/^\d{2}-\d{2}-\d{2}$/.test(t)) { cur = t; out[cur] = out[cur] || {btn: [], all: []}; continue; }
+    if (cur && /^\d{2}:\d{2}$/.test(t)) {
       out[cur].all.push(t);
-      if (el.closest("button, a, [role=button], .btn")) out[cur].btn.push(t);
+      const b = el.closest("button, a, [role=button], .btn, input[type=button], input[type=submit], input[type=radio]");
+      if (b && !b.disabled && !b.classList.contains("disabled")) out[cur].btn.push(t);
     }
   }
   return out;
+}
+"""
+
+# Debug : HTML autour de la première heure trouvée (pour comprendre la structure).
+JS_DEBUG_HTML = r"""
+() => {
+  for (const el of document.querySelectorAll("body *")) {
+    const t = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join("").trim();
+    if (/^\d{2}:\d{2}$/.test(t)) {
+      const a = (el.parentElement && el.parentElement.parentElement) || el.parentElement || el;
+      return a.outerHTML.slice(0, 1800);
+    }
+  }
+  return "";
 }
 """
 
@@ -55,7 +73,11 @@ def send_photo(path, caption=""):
 
 
 def format_slots(slots):
-    lines = [f"{d} : {', '.join(t)}" for d, t in sorted(slots.items(), key=lambda kv: tuple(reversed(kv[0].split("-")))) if t]
+    lines = [
+        f"{d} : {', '.join(t)}"
+        for d, t in sorted(slots.items(), key=lambda kv: tuple(reversed(kv[0].split("-"))))
+        if t
+    ]
     return "\n".join(lines[:30]) or "(aucune heure lue)"
 
 
@@ -64,8 +86,10 @@ def read_calendar(page):
     page.wait_for_timeout(1500)
     data = page.evaluate(JS_CALENDAR)
     slots = {d: v["btn"] for d, v in data.items() if v["btn"]}
-    debug = ", ".join(f"{d}:{len(v['btn'])}/{len(v['all'])}" for d, v in list(data.items())[:8])
-    return slots, debug
+    debug = ", ".join(f"{d}:{len(v['btn'])}/{len(v['all'])}" for d, v in data.items() if v["all"] or v["btn"])
+    debug = debug or f"{len(data)} jours lus, aucune heure"
+    html = page.evaluate(JS_DEBUG_HTML) if TEST else ""
+    return slots, debug, html
 
 
 def body_text(page):
@@ -74,7 +98,7 @@ def body_text(page):
 
 def run():
     err = ""
-    slots, debug = {}, ""
+    slots, debug, html = {}, "", ""
     status = "unknown"
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -109,7 +133,7 @@ def run():
                 select_btn.first.click(timeout=10000)
                 page.wait_for_load_state("networkidle", timeout=60000)
                 page.wait_for_timeout(2000)
-                slots, debug = read_calendar(page)
+                slots, debug, html = read_calendar(page)
                 status = "available" if slots else "none"
             else:
                 text = body_text(page)
@@ -123,28 +147,29 @@ def run():
                         status = "none"
                     else:
                         status = "available"
-                        card = (
-                            page.locator("div")
-                            .filter(has_text=B_RE)
-                            .filter(has=select_btn)
-                            .last
-                        )
+                        card = page.locator("div").filter(has_text=B_RE).filter(has=select_btn).last
                         card.get_by_text(re.compile(r"^Sélectionner$")).click(timeout=10000)
                         page.wait_for_load_state("networkidle", timeout=60000)
                         page.wait_for_timeout(2000)
-                        slots, debug = read_calendar(page)
+                        slots, debug, html = read_calendar(page)
         except Exception as e:
             err += " | selection: " + repr(e)[:200]
 
+        # Capture : on descend vers le calendrier pour que la photo soit utile
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.35)")
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
         page.screenshot(path="page.png", full_page=False)
         final_url = page.url
         browser.close()
 
-    return status, slots, debug, err, final_url
+    return status, slots, debug, html, err, final_url
 
 
 def main():
-    status, slots, debug, err, final_url = run()
+    status, slots, debug, html, err, final_url = run()
 
     if status == "available":
         sig = hashlib.sha1(json.dumps(slots, sort_keys=True).encode()).hexdigest()[:10]
@@ -159,6 +184,8 @@ def main():
             f"Erreur: {err or 'aucune'}\nURL: {final_url}\n"
             f"Jours (boutons/toutes heures): {debug or '-'}\n\n{format_slots(slots)}"
         )
+        if html:
+            send("HTML autour de la 1re heure :\n" + html)
         send_photo("page.png", "Ce que voit le robot")
     elif state != last:
         if status == "available":
