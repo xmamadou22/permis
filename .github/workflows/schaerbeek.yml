@@ -53,15 +53,16 @@ jobs:
             exit 0
           fi
           end=$((SECONDS + 20700))   # ~5 h 45 min puis le job suivant prend le relais
-          i=0
-          while [ $SECONDS -lt $end ]; do
-            python check_schaerbeek.py || true &
-            # Anderlecht demande l'identité à chaque passage : on le vérifie 1 tour sur 3
-            if [ $((i % 3)) -eq 0 ]; then python check_anderlecht.py || true & fi
-            wait
-            i=$((i + 1))
-            sleep 5
-          done
+          # Chaque centre garde sa page ouverte et la recharge ; relancé s'il s'arrête.
+          watch() {
+            while [ $SECONDS -lt $end ]; do
+              WATCH=1 WATCH_SECONDS=$((end - SECONDS)) WATCH_INTERVAL="$2" python "$1" || true
+              sleep 10
+            done
+          }
+          watch check_schaerbeek.py 15 &    # recharge toutes les ~15 s
+          watch check_anderlecht.py 30 &    # recharge toutes les ~30 s
+          wait
 
       - name: Sauver l'état
         if: always()
