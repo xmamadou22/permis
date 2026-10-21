@@ -1,8 +1,10 @@
 import html as htmllib
 import json
 import os
+import random
 import re
 import sys
+import time
 from datetime import datetime
 
 import requests
@@ -22,6 +24,13 @@ TARGET_RE = (
     if CARD.upper() in ("B", "FIRST")
     else re.compile(r"Examen\s+théorique\s+Cat\.\s*" + re.escape(CARD), re.I)
 )
+
+TYPES_URL = ROOT + "Home/SelectExamType"
+WATCH = os.environ.get("WATCH") == "1"  # mode surveillance continue (une seule session qu'on recharge)
+WATCH_SECONDS = int(os.environ.get("WATCH_SECONDS") or 20700)
+WATCH_INTERVAL = float(os.environ.get("WATCH_INTERVAL") or 15)  # secondes entre deux rechargements
+SESSION_MAX = 1800  # on repart d'une session neuve au moins toutes les 30 min
+FAILS_BEFORE_ALERT = 3  # on n'envoie « bloqué » qu'après 3 échecs d'affilée
 
 # Calendrier : pour chaque date, heures cliquables (boutons) et toutes les heures vues.
 # On lit le texte propre de chaque élément (robuste si le bouton contient une icône).
@@ -121,69 +130,87 @@ def body_text(page):
     return re.sub(r"\s+", " ", page.inner_text("body").replace("\xa0", " "))
 
 
-def run():
+def new_context(browser):
+    return browser.new_context(locale="fr-BE", viewport={"width": 430, "height": 900})
+
+
+def login(page):
+    """Accueil -> Réserver -> date de validité de la carte -> Confirmer -> page des types d'examen."""
+    page.goto(ROOT, wait_until="networkidle", timeout=60000)
+    try:
+        page.get_by_text("FR", exact=True).first.click(timeout=5000)
+        page.wait_for_load_state("networkidle")
+    except Exception:
+        pass
+
+    page.get_by_text(re.compile(r"Réserver un rendez-vous", re.I)).last.click(timeout=10000)
+    field = page.get_by_placeholder(re.compile(r"par exemple", re.I))
+    field.wait_for(state="visible", timeout=15000)
+    field.click()
+    field.press_sequentially(ID_DATE, delay=60)
+    try:
+        page.get_by_role("checkbox").first.check(timeout=5000)
+    except Exception:
+        page.get_by_text(re.compile(r"Je déclare avoir", re.I)).click()
+    page.get_by_role("button", name=re.compile(r"Confirmer", re.I)).click()
+    page.wait_for_load_state("networkidle", timeout=60000)
+
+
+def on_types_page(page):
+    return "SelectExamType" in page.url
+
+
+def read_types(page):
+    """Lit la page des types d'examen ; si la carte cible est disponible, ouvre le calendrier et lit les heures."""
     err = ""
-    slots, debug, html = {}, "", ""
+    slots, debug = {}, ""
     status = "unknown"
+    select_btn = page.get_by_text(re.compile(r"^Sélectionner$"))
+    try:
+        if CARD == "first":
+            select_btn.first.click(timeout=10000)
+            page.wait_for_load_state("networkidle", timeout=60000)
+            page.wait_for_timeout(2000)
+            slots, debug, _ = read_calendar(page)
+            status = "available" if slots else "none"
+        else:
+            text = body_text(page)
+            m = TARGET_RE.search(text)
+            if m:
+                seg = text[m.end():]
+                j = seg.find("Examen")
+                if j != -1:
+                    seg = seg[:j]
+                if "Temporairement" in seg:
+                    status = "none"
+                else:
+                    status = "available"
+                    card = page.locator("div").filter(has_text=TARGET_RE).filter(has=select_btn).last
+                    card.get_by_text(re.compile(r"^Sélectionner$")).click(timeout=10000)
+                    page.wait_for_load_state("networkidle", timeout=60000)
+                    page.wait_for_timeout(2000)
+                    slots, debug, _ = read_calendar(page)
+    except Exception as e:
+        err = "selection: " + repr(e)[:200]
+    return status, slots, debug, err
+
+
+def run():
+    """Un seul passage complet (utilisé pour les tests)."""
+    err = ""
+    status, slots, debug = "unknown", {}, ""
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        ctx = browser.new_context(locale="fr-BE", viewport={"width": 430, "height": 900})
+        ctx = new_context(browser)
         page = ctx.new_page()
-
-        page.goto(ROOT, wait_until="networkidle", timeout=60000)
         try:
-            page.get_by_text("FR", exact=True).first.click(timeout=5000)
-            page.wait_for_load_state("networkidle")
-        except Exception:
-            pass
-
-        try:
-            page.get_by_text(re.compile(r"Réserver un rendez-vous", re.I)).last.click(timeout=10000)
-            field = page.get_by_placeholder(re.compile(r"par exemple", re.I))
-            field.wait_for(state="visible", timeout=15000)
-            field.click()
-            field.press_sequentially(ID_DATE, delay=60)
-            try:
-                page.get_by_role("checkbox").first.check(timeout=5000)
-            except Exception:
-                page.get_by_text(re.compile(r"Je déclare avoir", re.I)).click()
-            page.get_by_role("button", name=re.compile(r"Confirmer", re.I)).click()
-            page.wait_for_load_state("networkidle", timeout=60000)
+            login(page)
         except Exception as e:
             err = "etape carte: " + repr(e)[:200]
-
-        select_btn = page.get_by_text(re.compile(r"^Sélectionner$"))
-        try:
-            if CARD == "first":
-                select_btn.first.click(timeout=10000)
-                page.wait_for_load_state("networkidle", timeout=60000)
-                page.wait_for_timeout(2000)
-                slots, debug, html = read_calendar(page)
-                status = "available" if slots else "none"
-            else:
-                text = body_text(page)
-                m = TARGET_RE.search(text)
-                if m:
-                    seg = text[m.end():]
-                    j = seg.find("Examen")
-                    if j != -1:
-                        seg = seg[:j]
-                    if "Temporairement" in seg:
-                        status = "none"
-                    else:
-                        status = "available"
-                        card = page.locator("div").filter(has_text=TARGET_RE).filter(has=select_btn).last
-                        card.get_by_text(re.compile(r"^Sélectionner$")).click(timeout=10000)
-                        page.wait_for_load_state("networkidle", timeout=60000)
-                        page.wait_for_timeout(2000)
-                        slots, debug, html = read_calendar(page)
-        except Exception as e:
-            err += " | selection: " + repr(e)[:200]
-
-        final_url = page.url
+        status, slots, debug, err2 = read_types(page)
+        err = (err + " | " + err2).strip(" |") if err2 else err
         browser.close()
-
-    return status, slots, debug, html, err, final_url
+    return status, slots, debug, "", err, ""
 
 
 def load_state():
@@ -197,8 +224,8 @@ def pairs_of(slots):
     return {(d, t) for d, ts in slots.items() for t in ts}
 
 
-def main():
-    status, slots, debug, html, err, final_url = run()
+def handle(status, slots, err):
+    """Alerte (si besoin) et mémorisation de l'état. Jamais appelée pour un simple test."""
     last = load_state()
     new = pairs_of(slots) - pairs_of(last.get("slots", {}))
     key = status if (status != "available" or slots) else "available_noread"
@@ -207,13 +234,7 @@ def main():
     for d, t in sorted(new):
         new_slots.setdefault(d, []).append(t)
 
-    if TEST:
-        if key == "available":
-            send(build_alert(slots, {}, prefix=f"🧪 <i>Test (carte {htmllib.escape(CARD)})</i>\n"))
-        else:
-            extra = f"\nErreur : {htmllib.escape(err)}" if err else ""
-            send(f"🧪 Test Schaerbeek (carte {htmllib.escape(CARD)}) : statut = <b>{status}</b>{extra}")
-    elif key == "available" and new:
+    if key == "available" and new:
         send(build_alert(slots, new_slots))
     elif key == "available_noread" and last.get("status") != key:
         send(
@@ -223,10 +244,88 @@ def main():
     elif key == "unknown" and last.get("status") != "unknown":
         send(f"⚠️ <b>Schaerbeek</b> : le script ne trouve plus la carte Cat. B. {htmllib.escape(err)}")
 
-    if not TEST:  # un test ne doit pas marquer des créneaux comme « déjà vus »
-        json.dump({"status": key, "slots": slots}, open(STATE_FILE, "w"))
-    print("state:", key, "nouveaux:", len(new))
+    json.dump({"status": key, "slots": slots}, open(STATE_FILE, "w"))
+    return key, len(new)
+
+
+def main():
+    status, slots, debug, html, err, final_url = run()
+    if TEST:
+        key = status if (status != "available" or slots) else "available_noread"
+        if key == "available":
+            send(build_alert(slots, {}, prefix=f"🧪 <i>Test (carte {htmllib.escape(CARD)})</i>\n"))
+        else:
+            extra = f"\nErreur : {htmllib.escape(err)}" if err else ""
+            send(f"🧪 Test Schaerbeek (carte {htmllib.escape(CARD)}) : statut = <b>{status}</b>{extra}")
+        return 0
+    key, n_new = handle(status, slots, err)
+    print("state:", key, "nouveaux:", n_new)
+    return 0
+
+
+def watch():
+    """Reste sur la même session : on se reconnecte seulement si la session est perdue."""
+    end = time.time() + WATCH_SECONDS
+    logins = 0
+    fails = 0
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        ctx = page = None
+        started = 0.0
+
+        def fresh():
+            nonlocal ctx, page, started, logins
+            if ctx:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+            ctx = new_context(browser)
+            page = ctx.new_page()
+            login(page)
+            started = time.time()
+            logins += 1
+
+        while time.time() < end:
+            t0 = time.time()
+            try:
+                relogged = False
+                if page is None or time.time() - started > SESSION_MAX:
+                    fresh()
+                    relogged = True
+                else:
+                    page.goto(TYPES_URL, wait_until="networkidle", timeout=60000)  # « rafraîchir »
+                    if not on_types_page(page):
+                        fresh()
+                        relogged = True
+
+                status, slots, debug, err = read_types(page)
+                if (status == "unknown" or (status == "available" and not slots)) and not relogged:
+                    fresh()  # deuxième avis avec une session neuve avant d'alerter
+                    status, slots, debug, err = read_types(page)
+
+                if status == "unknown":
+                    fails += 1
+                    if fails >= FAILS_BEFORE_ALERT:
+                        handle(status, slots, err)
+                    print(time.strftime("%H:%M:%S"), "lecture impossible", fails, "/", FAILS_BEFORE_ALERT, flush=True)
+                    page = None  # on repart d'une session neuve
+                else:
+                    fails = 0
+                    key, n_new = handle(status, slots, err)
+                    print(time.strftime("%H:%M:%S"), "etat:", key, "| nouveaux:", n_new, "| connexions:", logins, flush=True)
+            except Exception as e:
+                page = None
+                fails += 1
+                if fails >= FAILS_BEFORE_ALERT:
+                    handle("unknown", {}, "session : " + repr(e)[:200])
+                print(time.strftime("%H:%M:%S"), "erreur de session", fails, "/", FAILS_BEFORE_ALERT, ": nouvelle connexion dans 45 s", flush=True)
+                time.sleep(45)
+                continue
+            time.sleep(max(2.0, WATCH_INTERVAL * random.uniform(0.8, 1.2) - (time.time() - t0)))
+        browser.close()
+    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(watch() if WATCH and not TEST else main())

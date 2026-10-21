@@ -1,6 +1,7 @@
 import html as htmllib
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -23,6 +24,12 @@ NAISSANCE = os.environ.get("AND_NAISSANCE", "").strip()  # JJ/MM/AAAA
 RRN = re.sub(r"\D", "", os.environ.get("AND_RRN", ""))  # 11 chiffres
 
 NO_PLACE_RE = re.compile(r"plus\s+de\s+places?", re.I)
+
+WATCH = os.environ.get("WATCH") == "1"  # mode surveillance continue (une seule session qu'on recharge)
+WATCH_SECONDS = int(os.environ.get("WATCH_SECONDS") or 20700)
+WATCH_INTERVAL = float(os.environ.get("WATCH_INTERVAL") or 30)  # secondes entre deux rechargements
+SESSION_MAX = 1800  # on repart d'une session neuve au moins toutes les 30 min
+FAILS_BEFORE_ALERT = 3  # on n'envoie « bloqué » qu'après 3 échecs d'affilée
 
 # Lit le calendrier de façon générique : dates (formats courants) + heures dans des boutons.
 JS_CALENDAR = r"""
@@ -120,13 +127,6 @@ def build_alert(slots, new_slots, prefix=""):
     return head + body + foot
 
 
-def load_state():
-    try:
-        return json.load(open(STATE_FILE))
-    except Exception:
-        return {"status": "", "slots": {}}
-
-
 def body_text(page):
     return re.sub(r"\s+", " ", page.inner_text("body").replace("\xa0", " "))
 
@@ -170,106 +170,144 @@ def wait_for_booking_page(ctx, timeout=30):
     raise RuntimeError(f"la page de réservation ne s'est pas ouverte (onglets : {urls})")
 
 
+STEP = ""
+LAST_PAGE = None
+
+
+def step(name):
+    global STEP
+    STEP = name
+
+
+def new_context(browser):
+    return browser.new_context(locale="fr-BE", viewport={"width": 430, "height": 900})
+
+
+def choose_theory(page):
+    step("choix de la catégorie B")
+    page.get_by_text(re.compile(r"Catégorie B", re.I)).first.click(timeout=15000)
+    page.wait_for_timeout(1000)
+
+    step("choix « Théorie B »")
+    page.get_by_text(re.compile(r"^\s*Théorie B\s*$", re.I)).first.click(timeout=15000)
+    page.wait_for_load_state("networkidle", timeout=60000)
+    page.wait_for_timeout(2500)
+
+
+def login(ctx):
+    """Site officiel -> Prendre un RDV -> identité -> catégorie B -> Théorie B. Renvoie la page des dates."""
+    global LAST_PAGE
+    page = ctx.new_page()
+    LAST_PAGE = page
+
+    step("ouverture du site")
+    page.goto(START, wait_until="networkidle", timeout=60000)
+
+    step("popup « J'ai compris »")
+    try:
+        page.get_by_text(re.compile(r"J.ai compris", re.I)).first.click(timeout=8000)
+        page.wait_for_timeout(1200)  # fin de l'animation de fermeture
+    except Exception:
+        pass
+
+    step("bouton « Prendre un RDV »")
+    target = first_visible(page, re.compile(r"Prendre un RDV", re.I))
+    href = target.evaluate("el => { const a = el.closest('a'); return a ? a.href : ''; }")
+    if href.startswith("http") and not href.rstrip("/").endswith("#"):
+        page.goto(href, wait_until="networkidle", timeout=60000)
+    else:
+        target.click(timeout=10000)
+    page = wait_for_booking_page(ctx, 30)
+    LAST_PAGE = page
+
+    step("cookies")
+    try_click(page, re.compile(r"Accepter et fermer", re.I), timeout=5000)
+
+    step("identité (prénom, nom)")
+    prenom = page.get_by_label(re.compile(r"Pr[ée]nom", re.I)).first
+    nom = page.get_by_label(re.compile(r"^\s*Nom", re.I)).first
+    try:
+        prenom.wait_for(state="visible", timeout=15000)
+    except Exception:
+        inputs = page.locator("input:visible")
+        prenom, nom = inputs.nth(0), inputs.nth(1)
+    type_into(prenom, PRENOM)
+    type_into(nom, NOM)
+
+    step("date de naissance")
+    jj, mm, aaaa = re.split(r"\D+", NAISSANCE)[:3]
+    type_into(page.get_by_placeholder("JJ"), jj)
+    type_into(page.get_by_placeholder("MM"), mm)
+    type_into(page.get_by_placeholder("AAAA"), aaaa)
+
+    step("numéro de registre national")
+    rrn = page.get_by_label(re.compile(r"registre national", re.I)).first
+    try:
+        rrn.wait_for(state="visible", timeout=3000)
+    except Exception:
+        rrn = page.locator("input:visible").nth(5)
+    type_into(rrn, RRN)
+
+    step("bouton Continuer")
+    page.get_by_text(re.compile(r"^\s*Continuer", re.I)).first.click(timeout=10000)
+    page.wait_for_load_state("networkidle", timeout=60000)
+    page.wait_for_timeout(1500)
+    if re.search(r"est invalide|invalide\.", body_text(page), re.I) and page.get_by_placeholder("JJ").count():
+        raise RuntimeError("identité refusée par le site (vérifie les secrets AND_*)")
+
+    choose_theory(page)
+    return page
+
+
+def on_date_step(page):
+    """Après un rechargement : True si on est (ou si on a pu revenir) sur l'écran des dates."""
+    text = body_text(page)
+    if re.search(r"Encoder le candidat", text, re.I) or page.get_by_placeholder("JJ").count():
+        return False  # retour au formulaire d'identité : il faut se reconnecter
+    if re.search(r"Sélectionner la catégorie", text, re.I):
+        choose_theory(page)  # simple retour à l'étape catégorie : pas besoin de ressaisir l'identité
+        text = body_text(page)
+    return bool(NO_PLACE_RE.search(text) or re.search(r"Prendre un rendez-vous", text, re.I) or re.search(r"\d{1,2}[:h]\d{2}", text))
+
+
+def read_dates(page):
+    step("lecture du calendrier")
+    text = body_text(page)
+    if NO_PLACE_RE.search(text):
+        return "none", {}
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page.wait_for_timeout(1500)
+    return "available", page.evaluate(JS_CALENDAR)
+
+
 def run():
+    """Un seul passage complet (utilisé pour les tests)."""
     status, slots, err, excerpt = "unknown", {}, "", ""
-    step = "démarrage"
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        ctx = browser.new_context(locale="fr-BE", viewport={"width": 430, "height": 900})
-        page = ctx.new_page()
+        ctx = new_context(browser)
         try:
-            step = "ouverture du site"
-            page.goto(START, wait_until="networkidle", timeout=60000)
-
-            step = "popup « J'ai compris »"
-            try:
-                page.get_by_text(re.compile(r"J.ai compris", re.I)).first.click(timeout=8000)
-                page.wait_for_timeout(1200)  # fin de l'animation de fermeture
-            except Exception:
-                pass
-
-            step = "bouton « Prendre un RDV »"
-            target = first_visible(page, re.compile(r"Prendre un RDV", re.I))
-            href = target.evaluate("el => { const a = el.closest('a'); return a ? a.href : ''; }")
-            if href.startswith("http") and not href.rstrip("/").endswith("#"):
-                page.goto(href, wait_until="networkidle", timeout=60000)
-            else:
-                target.click(timeout=10000)
-            page = wait_for_booking_page(ctx, 30)
-
-            step = "cookies"
-            try_click(page, re.compile(r"Accepter et fermer", re.I), timeout=5000)
-
-            step = "identité (prénom, nom)"
-            prenom = page.get_by_label(re.compile(r"Pr[ée]nom", re.I)).first
-            nom = page.get_by_label(re.compile(r"^\s*Nom", re.I)).first
-            try:
-                prenom.wait_for(state="visible", timeout=15000)
-            except Exception:
-                inputs = page.locator("input:visible")
-                prenom, nom = inputs.nth(0), inputs.nth(1)
-            type_into(prenom, PRENOM)
-            type_into(nom, NOM)
-
-            step = "date de naissance"
-            jj, mm, aaaa = re.split(r"\D+", NAISSANCE)[:3]
-            type_into(page.get_by_placeholder("JJ"), jj)
-            type_into(page.get_by_placeholder("MM"), mm)
-            type_into(page.get_by_placeholder("AAAA"), aaaa)
-
-            step = "numéro de registre national"
-            rrn = page.get_by_label(re.compile(r"registre national", re.I)).first
-            try:
-                rrn.wait_for(state="visible", timeout=3000)
-            except Exception:
-                rrn = page.locator("input:visible").nth(5)
-            type_into(rrn, RRN)
-
-            step = "bouton Continuer"
-            page.get_by_text(re.compile(r"^\s*Continuer", re.I)).first.click(timeout=10000)
-            page.wait_for_load_state("networkidle", timeout=60000)
-            page.wait_for_timeout(1500)
-            if re.search(r"est invalide|invalide\.", body_text(page), re.I) and page.get_by_placeholder("JJ").count():
-                raise RuntimeError("identité refusée par le site (vérifie les secrets AND_*)")
-
-            step = "choix de la catégorie B"
-            page.get_by_text(re.compile(r"Catégorie B", re.I)).first.click(timeout=15000)
-            page.wait_for_timeout(1000)
-
-            step = "choix « Théorie B »"
-            page.get_by_text(re.compile(r"^\s*Théorie B\s*$", re.I)).first.click(timeout=15000)
-            page.wait_for_load_state("networkidle", timeout=60000)
-            page.wait_for_timeout(2500)
-
-            step = "lecture du calendrier"
-            text = body_text(page)
-            if NO_PLACE_RE.search(text):
-                status = "none"
-            else:
-                status = "available"
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(1500)
-                slots = page.evaluate(JS_CALENDAR)
+            page = login(ctx)
+            status, slots = read_dates(page)
         except Exception as e:
-            err = f"étape « {step} » : {repr(e)[:220]}"
+            err = f"étape « {STEP} » : {repr(e)[:220]}"
             try:
-                excerpt = body_text(page)[:250]  # texte visible uniquement (pas les champs saisis)
+                excerpt = body_text(LAST_PAGE)[:250]  # texte visible uniquement (pas les champs saisis)
             except Exception:
                 pass
         browser.close()
     return status, slots, err, excerpt
 
 
-def main():
-    missing = [n for n, v in [("AND_PRENOM", PRENOM), ("AND_NOM", NOM), ("AND_NAISSANCE", NAISSANCE), ("AND_RRN", RRN)] if not v]
-    if missing:
-        print("Secrets manquants :", ", ".join(missing))
-        return 0
-    if len(RRN) != 11 or len(re.split(r"\D+", NAISSANCE)) < 3:
-        print("AND_RRN doit avoir 11 chiffres et AND_NAISSANCE le format JJ/MM/AAAA")
-        return 0
+def load_state():
+    try:
+        return json.load(open(STATE_FILE))
+    except Exception:
+        return {"status": "", "slots": {}}
 
-    status, slots, err, excerpt = run()
+
+def handle(status, slots, err):
+    """Alerte (si besoin) et mémorisation de l'état. Jamais appelée pour un simple test."""
     last = load_state()
     key = status if (status != "available" or slots) else "available_noread"
     new = pairs_of(slots) - pairs_of(last.get("slots", {}))
@@ -277,7 +315,37 @@ def main():
     for d, t in sorted(new):
         new_slots.setdefault(d, []).append(t)
 
+    if key == "available" and new:
+        send(build_alert(slots, new_slots))
+    elif key == "available_noread" and last.get("status") != key:
+        send(
+            f"🟡 <b>{CENTER}</b> : des places semblent disponibles, mais je n'ai pas pu lire les heures.\n"
+            f'👉 <a href="{START}">Ouvrir le site</a>'
+        )
+    elif key == "unknown" and last.get("status") != "unknown":
+        send(f"⚠️ <b>{CENTER}</b> : le script est bloqué.\n{htmllib.escape(err)}")
+
+    json.dump({"status": key, "slots": slots}, open(STATE_FILE, "w"))
+    return key, len(new)
+
+
+def check_config():
+    missing = [n for n, v in [("AND_PRENOM", PRENOM), ("AND_NOM", NOM), ("AND_NAISSANCE", NAISSANCE), ("AND_RRN", RRN)] if not v]
+    if missing:
+        print("Secrets manquants :", ", ".join(missing))
+        return False
+    if len(RRN) != 11 or len(re.split(r"\D+", NAISSANCE)) < 3:
+        print("AND_RRN doit avoir 11 chiffres et AND_NAISSANCE le format JJ/MM/AAAA")
+        return False
+    return True
+
+
+def main():
+    if not check_config():
+        return 0
+    status, slots, err, excerpt = run()
     if TEST:
+        key = status if (status != "available" or slots) else "available_noread"
         if key == "available":
             send(build_alert(slots, {}, prefix="🧪 <i>Test Anderlecht</i>\n"))
         elif key == "none":
@@ -289,21 +357,71 @@ def main():
             if excerpt:
                 msg += f"\n\nTexte de la page : <i>{htmllib.escape(excerpt)}</i>"
             send(msg)
-    elif key == "available" and new:
-        send(build_alert(slots, new_slots))
-    elif key == "available_noread" and last.get("status") != key:
-        send(
-            f"🟡 <b>{CENTER}</b> : des places semblent disponibles, mais je n'ai pas pu lire les heures.\n"
-            f'👉 <a href="{START}">Ouvrir le site</a>'
-        )
-    elif key == "unknown" and last.get("status") != "unknown":
-        send(f"⚠️ <b>{CENTER}</b> : le script est bloqué.\n{htmllib.escape(err)}")
+        return 0
+    key, n_new = handle(status, slots, err)
+    print("state:", key, "nouveaux:", n_new)
+    return 0
 
-    if not TEST:  # un test ne doit pas marquer des créneaux comme « déjà vus »
-        json.dump({"status": key, "slots": slots}, open(STATE_FILE, "w"))
-    print("state:", key, "nouveaux:", len(new))
+
+def watch():
+    """Reste sur la même session : on recharge la page des dates, et on se reconnecte seulement si besoin."""
+    if not check_config():
+        return 0
+    end = time.time() + WATCH_SECONDS
+    logins = 0
+    fails = 0
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        ctx = page = None
+        started = 0.0
+
+        def fresh():
+            nonlocal ctx, page, started, logins
+            if ctx:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+            ctx = new_context(browser)
+            page = login(ctx)
+            started = time.time()
+            logins += 1
+
+        while time.time() < end:
+            t0 = time.time()
+            try:
+                relogged = False
+                if page is None or time.time() - started > SESSION_MAX:
+                    fresh()
+                    relogged = True
+                else:
+                    step("rechargement de la page")
+                    page.reload(wait_until="networkidle", timeout=60000)  # « rafraîchir »
+                    page.wait_for_timeout(2000)
+                    if not on_date_step(page):
+                        fresh()
+                        relogged = True
+
+                status, slots = read_dates(page)
+                if status == "available" and not slots and not relogged:
+                    fresh()  # deuxième avis avec une session neuve avant d'alerter
+                    status, slots = read_dates(page)
+
+                fails = 0
+                key, n_new = handle(status, slots, "")
+                print(time.strftime("%H:%M:%S"), "etat:", key, "| nouveaux:", n_new, "| connexions:", logins, flush=True)
+            except Exception as e:
+                page = None
+                fails += 1
+                if fails >= FAILS_BEFORE_ALERT:
+                    handle("unknown", {}, f"étape « {STEP} » : {repr(e)[:200]}")
+                print(time.strftime("%H:%M:%S"), "erreur de session", fails, "/", FAILS_BEFORE_ALERT, ": nouvelle connexion dans 60 s", flush=True)
+                time.sleep(60)
+                continue
+            time.sleep(max(2.0, WATCH_INTERVAL * random.uniform(0.8, 1.2) - (time.time() - t0)))
+        browser.close()
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(watch() if WATCH and not TEST else main())
