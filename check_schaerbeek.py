@@ -1,4 +1,3 @@
-import hashlib
 import json
 import os
 import re
@@ -15,7 +14,12 @@ TOKEN = os.environ["TG_TOKEN"]
 CHAT_ID = os.environ["TG_CHAT_ID"]
 ID_DATE = os.environ["ID_DATE"]  # date de validité de la carte, ex. JJ/MM/AAAA
 TEST = os.environ.get("TEST") == "1"
-CARD = (os.environ.get("CARD") or "B").strip()  # "B" = vraie surveillance, "first" = test sur la 1re carte
+CARD = (os.environ.get("CARD") or "B").strip()  # "B" = vraie surveillance, "first" = 1re carte, ou ex. "C1" pour tester
+TARGET_RE = (
+    B_RE
+    if CARD.upper() in ("B", "FIRST")
+    else re.compile(r"Examen\s+théorique\s+Cat\.\s*" + re.escape(CARD), re.I)
+)
 
 # Calendrier : pour chaque date, heures cliquables (boutons) et toutes les heures vues.
 # On lit le texte propre de chaque élément (robuste si le bouton contient une icône).
@@ -137,7 +141,7 @@ def run():
                 status = "available" if slots else "none"
             else:
                 text = body_text(page)
-                m = B_RE.search(text)
+                m = TARGET_RE.search(text)
                 if m:
                     seg = text[m.end():]
                     j = seg.find("Examen")
@@ -147,7 +151,7 @@ def run():
                         status = "none"
                     else:
                         status = "available"
-                        card = page.locator("div").filter(has_text=B_RE).filter(has=select_btn).last
+                        card = page.locator("div").filter(has_text=TARGET_RE).filter(has=select_btn).last
                         card.get_by_text(re.compile(r"^Sélectionner$")).click(timeout=10000)
                         page.wait_for_load_state("networkidle", timeout=60000)
                         page.wait_for_timeout(2000)
@@ -168,15 +172,22 @@ def run():
     return status, slots, debug, html, err, final_url
 
 
+def load_state():
+    try:
+        return json.load(open(STATE_FILE))
+    except Exception:
+        return {"status": "", "slots": {}}
+
+
+def pairs_of(slots):
+    return {(d, t) for d, ts in slots.items() for t in ts}
+
+
 def main():
     status, slots, debug, html, err, final_url = run()
-
-    if status == "available":
-        sig = hashlib.sha1(json.dumps(slots, sort_keys=True).encode()).hexdigest()[:10]
-        state = "available:" + sig
-    else:
-        state = status
-    last = open(STATE_FILE).read().strip() if os.path.exists(STATE_FILE) else ""
+    last = load_state()
+    new = pairs_of(slots) - pairs_of(last.get("slots", {}))
+    key = status if (status != "available" or slots) else "available_noread"
 
     if TEST:
         send(
@@ -187,15 +198,22 @@ def main():
         if html:
             send("HTML autour de la 1re heure :\n" + html)
         send_photo("page.png", "Ce que voit le robot")
-    elif state != last:
-        if status == "available":
-            send(f"🟢 Schaerbeek : places disponibles (théorie B) !\n\n{format_slots(slots)}\n\n{ROOT}")
-            send_photo("page.png", "Page au moment de l'alerte")
-        elif status == "unknown":
-            send(f"⚠️ Schaerbeek : le script ne trouve plus la carte Cat. B. {err}")
+    elif key == "available" and new:
+        new_slots = {}
+        for d, t in sorted(new):
+            new_slots.setdefault(d, []).append(t)
+        send(
+            f"🟢 Schaerbeek : nouveaux créneaux (théorie B) !\n\n{format_slots(new_slots)}"
+            f"\n\nTous les créneaux :\n{format_slots(slots)}\n\n{ROOT}"
+        )
+        send_photo("page.png", "Page au moment de l'alerte")
+    elif key == "available_noread" and last.get("status") != key:
+        send(f"🟡 Schaerbeek : des places semblent disponibles mais je n'ai pas pu lire les heures. {err}\n{ROOT}")
+    elif key == "unknown" and last.get("status") != "unknown":
+        send(f"⚠️ Schaerbeek : le script ne trouve plus la carte Cat. B. {err}")
 
-    open(STATE_FILE, "w").write(state)
-    print("state:", state)
+    json.dump({"status": key, "slots": slots}, open(STATE_FILE, "w"))
+    print("state:", key, "nouveaux:", len(new))
 
 
 if __name__ == "__main__":
