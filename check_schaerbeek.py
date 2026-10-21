@@ -1,7 +1,9 @@
+import html as htmllib
 import json
 import os
 import re
 import sys
+from datetime import datetime
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -43,46 +45,65 @@ JS_CALENDAR = r"""
 }
 """
 
-# Debug : HTML autour de la première heure trouvée (pour comprendre la structure).
-JS_DEBUG_HTML = r"""
-() => {
-  for (const el of document.querySelectorAll("body *")) {
-    const t = Array.from(el.childNodes).filter(n => n.nodeType === 3).map(n => n.textContent).join("").trim();
-    if (/^\d{2}:\d{2}$/.test(t)) {
-      const a = (el.parentElement && el.parentElement.parentElement) || el.parentElement || el;
-      return a.outerHTML.slice(0, 1800);
-    }
-  }
-  return "";
-}
-"""
-
-
 def send(msg):
     requests.post(
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": msg[:3900]},
+        data={
+            "chat_id": CHAT_ID,
+            "text": msg[:4000],
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "true",
+        },
         timeout=20,
     )
 
 
-def send_photo(path, caption=""):
-    with open(path, "rb") as f:
-        requests.post(
-            f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
-            data={"chat_id": CHAT_ID, "caption": caption[:900]},
-            files={"photo": f},
-            timeout=60,
-        )
+JOURS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
 
 
-def format_slots(slots):
+def date_key(d):
+    try:
+        return datetime.strptime(d, "%d-%m-%y")
+    except ValueError:
+        return datetime.max
+
+
+def day_label(d):
+    try:
+        dt = datetime.strptime(d, "%d-%m-%y")
+        return f"{JOURS[dt.weekday()]} {dt.strftime('%d/%m')}"
+    except ValueError:
+        return d
+
+
+def day_lines(slots, cap=25):
+    days = [(d, ts) for d, ts in sorted(slots.items(), key=lambda kv: date_key(kv[0])) if ts]
     lines = [
-        f"{d} : {', '.join(t)}"
-        for d, t in sorted(slots.items(), key=lambda kv: tuple(reversed(kv[0].split("-"))))
-        if t
+        f"📅 <b>{htmllib.escape(day_label(d))}</b> — " + "  ·  ".join(htmllib.escape(t) for t in sorted(ts))
+        for d, ts in days[:cap]
     ]
-    return "\n".join(lines[:30]) or "(aucune heure lue)"
+    if len(days) > cap:
+        lines.append(f"… et {len(days) - cap} jour(s) de plus")
+    return "\n".join(lines) or "(aucune heure lue)"
+
+
+def build_alert(slots, new_slots, prefix=""):
+    n_slots = sum(len(v) for v in slots.values())
+    n_days = sum(1 for v in slots.values() if v)
+    head = (
+        f"{prefix}🟢 <b>Places disponibles à Schaerbeek</b>\n"
+        f"🚗 Examen théorique · permis B\n"
+        f"🕒 {n_slots} créneau(x) sur {n_days} jour(s)\n\n"
+    )
+    if new_slots and pairs_of(new_slots) != pairs_of(slots):
+        body = (
+            "🆕 <b>Nouveaux créneaux</b>\n" + day_lines(new_slots, 12)
+            + "\n\n📋 <b>Tous les créneaux</b>\n" + day_lines(slots, 12)
+        )
+    else:
+        body = "📋 <b>Créneaux disponibles</b>\n" + day_lines(slots)
+    foot = f'\n\n👉 <a href="{ROOT}">Réserver maintenant</a>\n<i>Les créneaux partent vite.</i>'
+    return head + body + foot
 
 
 def read_calendar(page):
@@ -92,7 +113,7 @@ def read_calendar(page):
     slots = {d: v["btn"] for d, v in data.items() if v["btn"]}
     debug = ", ".join(f"{d}:{len(v['btn'])}/{len(v['all'])}" for d, v in data.items() if v["all"] or v["btn"])
     debug = debug or f"{len(data)} jours lus, aucune heure"
-    html = page.evaluate(JS_DEBUG_HTML) if TEST else ""
+    html = ""
     return slots, debug, html
 
 
@@ -159,13 +180,6 @@ def run():
         except Exception as e:
             err += " | selection: " + repr(e)[:200]
 
-        # Capture : on descend vers le calendrier pour que la photo soit utile
-        try:
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight * 0.35)")
-            page.wait_for_timeout(500)
-        except Exception:
-            pass
-        page.screenshot(path="page.png", full_page=False)
         final_url = page.url
         browser.close()
 
@@ -189,28 +203,25 @@ def main():
     new = pairs_of(slots) - pairs_of(last.get("slots", {}))
     key = status if (status != "available" or slots) else "available_noread"
 
+    new_slots = {}
+    for d, t in sorted(new):
+        new_slots.setdefault(d, []).append(t)
+
     if TEST:
-        send(
-            f"Test Schaerbeek (carte={CARD}) : statut = {status}\n"
-            f"Erreur: {err or 'aucune'}\nURL: {final_url}\n"
-            f"Jours (boutons/toutes heures): {debug or '-'}\n\n{format_slots(slots)}"
-        )
-        if html:
-            send("HTML autour de la 1re heure :\n" + html)
-        send_photo("page.png", "Ce que voit le robot")
+        if key == "available":
+            send(build_alert(slots, {}, prefix=f"🧪 <i>Test (carte {htmllib.escape(CARD)})</i>\n"))
+        else:
+            extra = f"\nErreur : {htmllib.escape(err)}" if err else ""
+            send(f"🧪 Test Schaerbeek (carte {htmllib.escape(CARD)}) : statut = <b>{status}</b>{extra}")
     elif key == "available" and new:
-        new_slots = {}
-        for d, t in sorted(new):
-            new_slots.setdefault(d, []).append(t)
-        send(
-            f"🟢 Schaerbeek : nouveaux créneaux (théorie B) !\n\n{format_slots(new_slots)}"
-            f"\n\nTous les créneaux :\n{format_slots(slots)}\n\n{ROOT}"
-        )
-        send_photo("page.png", "Page au moment de l'alerte")
+        send(build_alert(slots, new_slots))
     elif key == "available_noread" and last.get("status") != key:
-        send(f"🟡 Schaerbeek : des places semblent disponibles mais je n'ai pas pu lire les heures. {err}\n{ROOT}")
+        send(
+            "🟡 <b>Schaerbeek</b> : des places semblent disponibles, mais je n'ai pas pu lire les heures.\n"
+            f'👉 <a href="{ROOT}">Ouvrir le site</a>'
+        )
     elif key == "unknown" and last.get("status") != "unknown":
-        send(f"⚠️ Schaerbeek : le script ne trouve plus la carte Cat. B. {err}")
+        send(f"⚠️ <b>Schaerbeek</b> : le script ne trouve plus la carte Cat. B. {htmllib.escape(err)}")
 
     json.dump({"status": key, "slots": slots}, open(STATE_FILE, "w"))
     print("state:", key, "nouveaux:", len(new))
