@@ -1,1 +1,1 @@
-{"status": "unknown", "slots": {}}
+{"status": "none", "slots": {}}
