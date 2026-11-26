@@ -1,1 +1,1 @@
-{"status": "none", "slots": {}}
+{"status": "available", "slots": {"26-11-26": ["07:12"]}}
