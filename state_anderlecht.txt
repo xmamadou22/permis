@@ -1,1 +1,1 @@
-{"status": "none", "slots": {}}
+{"status": "available_noread", "slots": {}}
